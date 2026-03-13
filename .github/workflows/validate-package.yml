@@ -1,0 +1,17 @@
+name: Validate Package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate repository package
+        shell: pwsh
+        run: .\scripts\validate-package.ps1
