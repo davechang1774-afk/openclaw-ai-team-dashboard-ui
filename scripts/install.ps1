@@ -140,10 +140,18 @@ $manifest = [pscustomobject]@{
 }
 $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $targetDir ".openclaw-ai-team-dashboard-install.json") -Encoding UTF8
 
-try {
-  $validation = & openclaw config validate 2>&1
-} catch {
-  $validation = $_.Exception.Message
+$defaultHome = Join-Path $env:USERPROFILE ".openclaw"
+$resolvedOpenClawHome = [System.IO.Path]::GetFullPath($OpenClawHome)
+$resolvedDefaultHome = [System.IO.Path]::GetFullPath($defaultHome)
+
+if ($resolvedOpenClawHome -ieq $resolvedDefaultHome) {
+  try {
+    $validation = & openclaw config validate 2>&1
+  } catch {
+    $validation = $_.Exception.Message
+  }
+} else {
+  $validation = "已跳过 OpenClaw CLI 验证：当前安装目标不是默认 ~/.openclaw。OpenClaw 目前不支持对自定义 OpenClawHome 直接执行 config validate，但文件复制和配置写入已完成。"
 }
 
 Write-Host ""
