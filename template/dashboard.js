@@ -259,6 +259,78 @@ function buildGatewayUrl(basePath) {
   return `${protocol}://${window.location.host}${basePath}`;
 }
 
+function isStockRoute() {
+  return /\/stock(?:\/|$)/i.test(window.location.pathname);
+}
+
+function stockBasePath() {
+  const pathname = window.location.pathname || "";
+  const index = pathname.toLowerCase().indexOf("/stock");
+  if (index <= 0) {
+    return "";
+  }
+  const base = pathname.slice(0, index);
+  return base === "/" ? "" : base;
+}
+
+function joinBasePath(basePath, suffix) {
+  if (!basePath) {
+    return suffix;
+  }
+  return `${basePath}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
+}
+
+async function bootStockControlUi() {
+  const mount = document.getElementById("app");
+  if (!mount) {
+    return;
+  }
+  const basePath = stockBasePath();
+  const session = new URL(window.location.href).searchParams.get("session");
+  window.__OPENCLAW_CONTROL_UI_BASE_PATH__ = basePath;
+  try {
+    const key = STOCK_SETTINGS_KEY;
+    const raw = window.localStorage.getItem(key);
+    const current = raw ? JSON.parse(raw) : {};
+    const next = { ...current, chatFocusMode: true, navCollapsed: true };
+    if (session) {
+      next.sessionKey = session;
+      next.lastActiveSessionKey = session;
+    }
+    window.localStorage.setItem(key, JSON.stringify(next));
+  } catch {
+    // ignore
+  }
+  try {
+    const indexResponse = await fetch(joinBasePath(basePath, "/official-index-current.txt"), {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    if (!indexResponse.ok) {
+      throw new Error(`无法读取官方控制台入口 (${indexResponse.status})`);
+    }
+    const html = await indexResponse.text();
+    const jsAsset = html.match(/src="\.\/assets\/([^"]+\.js)"/i)?.[1];
+    const cssAsset = html.match(/href="\.\/assets\/([^"]+\.css)"/i)?.[1];
+    if (!jsAsset || !cssAsset) {
+      throw new Error("未找到官方控制台所需的 js/css 资源");
+    }
+    document.title = "OpenClaw Control";
+    mount.outerHTML = "<openclaw-app></openclaw-app>";
+    const cssUrl = joinBasePath(basePath, `/assets/${cssAsset}`);
+    const jsUrl = new URL(joinBasePath(basePath, `/assets/${jsAsset}`), window.location.origin).href;
+    const officialCss = document.createElement("link");
+    officialCss.rel = "stylesheet";
+    officialCss.crossOrigin = "";
+    officialCss.href = cssUrl;
+    document.head.appendChild(officialCss);
+    await import(jsUrl);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || "加载失败");
+    mount.innerHTML = `<div style="padding:32px;color:#f5f7fb;font-family:system-ui;background:#0f1117;min-height:100vh"><h1 style="margin:0 0 12px;font-size:24px">OpenClaw 原生控制台加载失败</h1><p style="margin:0;color:#9ba6bf;line-height:1.8">当前无法装载官方 3.13 控制台资源。<br/>错误：${esc(message)}</p></div>`;
+  }
+}
+
 function saveStockSettings(patch) {
   try {
     const raw = window.localStorage.getItem(STOCK_SETTINGS_KEY);
@@ -1475,6 +1547,221 @@ function commitItemsForCurrentSession() {
     .slice(0, 10);
 }
 
+function formatCompactNumber(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "0";
+  }
+  return new Intl.NumberFormat("zh-CN", {
+    notation: numeric >= 1000 ? "compact" : "standard",
+    maximumFractionDigits: numeric >= 1000 ? 1 : 0,
+  }).format(numeric);
+}
+
+function formatCost(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "未上报";
+  }
+  return `$${numeric.toFixed(numeric >= 1 ? 2 : 4)}`;
+}
+
+function usageSessionsForAgent(agentId) {
+  return state.sessions.filter((session) => norm(session?.agentId) === norm(agentId) && session?.usage);
+}
+
+function aggregateUsageForAgent(agentId) {
+  const sessions = usageSessionsForAgent(agentId);
+  const models = new Map();
+  const providers = new Map();
+  const tools = new Map();
+  const usage = {
+    sessions: sessions.length,
+    messages: 0,
+    toolCalls: 0,
+    toolResults: 0,
+    errors: 0,
+    tokens: 0,
+    cost: 0,
+    requests: 0,
+    hasUsage: false,
+  };
+
+  const mergeEntry = (bucket, key, patch) => {
+    if (!key) {
+      return;
+    }
+    const current = bucket.get(key) || { key, count: 0, tokens: 0, cost: 0 };
+    current.count += Number(patch?.count || 0);
+    current.tokens += Number(patch?.tokens || 0);
+    current.cost += Number(patch?.cost || 0);
+    bucket.set(key, current);
+  };
+
+  sessions.forEach((session) => {
+    const current = session?.usage;
+    if (!current || typeof current !== "object") {
+      return;
+    }
+    usage.hasUsage = true;
+    const messageCounts = current.messageCounts || {};
+    const toolUsage = current.toolUsage || {};
+    usage.messages += Number(messageCounts.total || 0);
+    usage.requests += Number(messageCounts.user || 0);
+    usage.toolCalls += Number(messageCounts.toolCalls || toolUsage.totalCalls || 0);
+    usage.toolResults += Number(messageCounts.toolResults || 0);
+    usage.errors += Number(messageCounts.errors || 0);
+    usage.tokens += Number(current.totalTokens || 0);
+    usage.cost += Number(current.totalCost || 0);
+
+    if (Array.isArray(toolUsage.tools)) {
+      toolUsage.tools.forEach((tool) => {
+        mergeEntry(tools, norm(tool?.name), {
+          count: Number(tool?.count || 0),
+        });
+      });
+    }
+
+    if (Array.isArray(current.modelUsage) && current.modelUsage.length) {
+      current.modelUsage.forEach((entry) => {
+        const provider = norm(entry?.provider) || norm(session?.modelProvider) || "unknown";
+        const model = norm(entry?.model) || norm(session?.model) || "unknown";
+        const totals = entry?.totals || {};
+        mergeEntry(models, `${provider}/${model}`, {
+          count: Number(entry?.count || 0),
+          tokens: Number(totals.totalTokens || 0),
+          cost: Number(totals.totalCost || 0),
+        });
+        mergeEntry(providers, provider, {
+          count: Number(entry?.count || 0),
+          tokens: Number(totals.totalTokens || 0),
+          cost: Number(totals.totalCost || 0),
+        });
+      });
+    } else {
+      const model = norm(session?.model || session?.modelOverride);
+      const provider = norm(session?.modelProvider || session?.providerOverride || (model.includes("/") ? model.split("/")[0] : ""));
+      if (model) {
+        mergeEntry(models, model, {
+          count: Number(messageCounts.assistant || messageCounts.total || 0),
+          tokens: Number(current.totalTokens || 0),
+          cost: Number(current.totalCost || 0),
+        });
+      }
+      if (provider) {
+        mergeEntry(providers, provider, {
+          count: Number(messageCounts.assistant || messageCounts.total || 0),
+          tokens: Number(current.totalTokens || 0),
+          cost: Number(current.totalCost || 0),
+        });
+      }
+    }
+  });
+
+  const byWeight = (entries) =>
+    [...entries.values()].sort((a, b) => {
+      const byTokens = Number(b.tokens || 0) - Number(a.tokens || 0);
+      if (byTokens !== 0) {
+        return byTokens;
+      }
+      return Number(b.count || 0) - Number(a.count || 0);
+    });
+
+  return {
+    ...usage,
+    models: byWeight(models),
+    providers: byWeight(providers),
+    tools: byWeight(tools),
+    errorRate: usage.messages ? usage.errors / usage.messages : 0,
+  };
+}
+
+function humanizeOperation(item) {
+  const target = item.files?.length ? basename(item.files[0]) : "";
+  const detail = norm(item.detail).replace(/^with\s+(run|from|file|target|pattern)\s+/i, "");
+  if (item.title === "Read") {
+    return target ? `我刚刚读取了 ${target}，在确认当前内容和上下文。` : "我刚刚读取了一段文件或输出内容。";
+  }
+  if (item.title === "Edit") {
+    return target ? `我正在调整 ${target} 里的配置或代码。` : "我刚刚修改了一处配置或脚本。";
+  }
+  if (item.title === "Write") {
+    return target ? `我写入了 ${target}，把新的内容落到了本地。` : "我刚刚写入了一份新内容。";
+  }
+  if (item.title === "Exec") {
+    return detail ? `我执行了一条命令：${shortenText(detail, 96)}` : "我运行了一条终端命令。";
+  }
+  if (item.title === "Search") {
+    return detail ? `我检索了目标内容：${shortenText(detail, 96)}` : "我刚刚做了一次搜索。";
+  }
+  if (item.title === "Fetch") {
+    return detail ? `我请求了一个外部资源：${shortenText(detail, 96)}` : "我拉取了一次外部数据。";
+  }
+  return detail ? `我刚刚完成了一步操作：${shortenText(detail, 96)}` : "我刚刚完成了一步操作。";
+}
+
+function operationTag(status) {
+  if (status === "failed") {
+    return "error";
+  }
+  if (status === "running") {
+    return "processing";
+  }
+  return "complete";
+}
+
+function renderOpsLogCards(selectedAgent) {
+  const selected = agentMeta(selectedAgent);
+  const items = commitItemsForCurrentSession();
+  if (!items.length) {
+    return emptyState(`${selected.name} 当前会话还没有即时操作日志`, "等这个 agent 读文件、执行命令或修改脚本后，这里会自动转成更容易读懂的操作反馈。");
+  }
+  return `<div class="app-ops-list">${items.map((item) => {
+    const files = item.files?.length
+      ? `<div class="app-ops-files">${item.files.map((file) => `<span class="app-activity-chip" title="${esc(file)}">${esc(basename(file))}</span>`).join("")}</div>`
+      : "";
+    const preview = item.preview ? `<div class="app-ops-preview">${esc(item.preview)}</div>` : "";
+    return `<div class="app-ops-row"><div class="app-log-entry"><span class="app-log-time">${esc(formatTime(item.timestamp || Date.now()))}</span><span class="app-log-tag ${esc(operationTag(item.status))}">${esc(item.title)}</span><span class="app-log-content">${esc(humanizeOperation(item))}</span></div>${files}${preview}</div>`;
+  }).join("")}</div>`;
+}
+
+function usageMetricCard(label, value, sub = "", tone = "") {
+  return `<div class="app-usage-stat ${esc(tone)}"><div class="app-usage-stat-label">${esc(label)}</div><div class="app-usage-stat-value">${esc(value)}</div><div class="app-usage-stat-sub">${esc(sub || " ")}</div></div>`;
+}
+
+function renderUsageListBlock(title, items, formatter) {
+  if (!items.length) {
+    return `<div class="app-usage-block"><div class="app-usage-block-title">${esc(title)}</div><div class="app-empty">当前没有可汇总的数据</div></div>`;
+  }
+  return `<div class="app-usage-block"><div class="app-usage-block-title">${esc(title)}</div><div class="app-usage-list">${items.map((item) => formatter(item)).join("")}</div></div>`;
+}
+
+function renderUsageCard(selectedAgent) {
+  const summary = aggregateUsageForAgent(selectedAgent.id);
+  const activeRoute = currentRouteStatus(selectedAgent, state.sessionKey);
+  if (!summary.hasUsage) {
+    return emptyState("当前还没有 Usage 数据", "先在这个 agent 下产生几次对话或工具调用，网关上报后这里就会出现 token、模型和工具消耗。");
+  }
+  return `
+    <div class="app-usage-grid">
+      <div class="app-usage-summary-grid">
+        ${usageMetricCard("当前命中", shortModelName(activeRoute.model || primaryModel(selectedAgent) || "未配置"), activeRoute.levelLabel)}
+        ${usageMetricCard("请求次数", formatCompactNumber(summary.requests), `${summary.sessions} 个会话`)}
+        ${usageMetricCard("消息总量", formatCompactNumber(summary.messages), `${formatCompactNumber(summary.toolResults)} 条工具结果`)}
+        ${usageMetricCard("工具调用", formatCompactNumber(summary.toolCalls), `${summary.tools.length} 种工具`)}
+        ${usageMetricCard("总 Tokens", formatCompactNumber(summary.tokens), "最近已追踪会话")}
+        ${usageMetricCard("错误率", `${(summary.errorRate * 100).toFixed(1)}%`, `${formatCompactNumber(summary.errors)} 条错误`, summary.errorRate > 0.1 ? "warn" : "")}
+        ${usageMetricCard("总成本", formatCost(summary.cost), "供应商已上报部分")}
+        ${usageMetricCard("剩余额度", "网关未上报", "如后续 API 暴露会自动接入")}
+      </div>
+      <div class="app-usage-lists">
+        ${renderUsageListBlock("Top Models", summary.models.slice(0, 4), (item) => `<div class="app-usage-row"><span class="app-usage-key">${esc(shortModelName(item.key))}</span><span class="app-usage-value">${esc(formatCompactNumber(item.tokens || item.count))}</span></div>`)}
+        ${renderUsageListBlock("Top Providers", summary.providers.slice(0, 4), (item) => `<div class="app-usage-row"><span class="app-usage-key">${esc(item.key)}</span><span class="app-usage-value">${esc(formatCompactNumber(item.tokens || item.count))}</span></div>`)}
+        ${renderUsageListBlock("Top Tools", summary.tools.slice(0, 6), (item) => `<div class="app-usage-row"><span class="app-usage-key">${esc(item.key)}</span><span class="app-usage-value">${esc(formatCompactNumber(item.count))} 次</span></div>`)}
+      </div>
+    </div>`;
+}
+
 function renderCommitCards() {
   const items = commitItemsForCurrentSession();
   const selected = agentMeta(getAgent(state.selectedAgentId));
@@ -2369,21 +2656,21 @@ function renderStatsTab() {
 function renderMemoryTab(selectedAgent) {
   const selected = agentMeta(selectedAgent);
   const activeRoute = currentRouteStatus(selectedAgent, state.sessionKey);
-  const currentHistory =
-    state.chatMessages.length || state.chatStream
-      ? `${state.chatMessages.map((message) => renderChatMessage(message, selected)).join("")}${state.chatStream ? `<div class="app-chat-bubble assistant streaming"><div class="app-chat-sender">${esc(selected.avatar)} ${esc(selected.name)}</div><div>${esc(state.chatStream)}</div></div>` : ""}`
-      : emptyState("当前会话还没有记忆片段", "先和当前 agent 对话一次，这里就会累积上下文。");
   return `
     <div class="app-container">
       ${renderSidebar()}
       <div class="app-content" data-scroll-tab="memory">
         ${renderAuthBanner()}
         <div class="app-section-title">每日记忆</div>
-        <div class="app-section-sub">这里展示当前会话内容、近期 session 轨迹和系统侧上下文，方便继续接力。</div>
+        <div class="app-section-sub">这里保留当前 agent 的即时操作轨迹、使用情况和近期接力线索，避免和“思考＆对话”重复。</div>
         <div class="app-feature-grid">
-          <div class="app-feature-card full app-chat-panel app-memory-panel" id="memory-current">
-            <div class="app-feature-head"><h3>🧠 当前会话记忆</h3><span class="af-cnt">${esc(state.chatMessages.length)}</span></div>
-            <div class="app-feature-body"><div class="app-chat-body memory-view" data-chat-scroll="memory">${currentHistory}</div></div>
+          <div class="app-feature-card" id="memory-logs">
+            <div class="app-feature-head"><h3>🪵 日志</h3><span class="af-cnt">${esc(commitItemsForCurrentSession().length)}</span></div>
+            <div class="app-feature-body">${renderOpsLogCards(selectedAgent)}</div>
+          </div>
+          <div class="app-feature-card" id="memory-usage">
+            <div class="app-feature-head"><h3>📊 使用情况</h3><span class="af-cnt">${esc(usageSessionsForAgent(selectedAgent.id).length)}</span></div>
+            <div class="app-feature-body">${renderUsageCard(selectedAgent)}</div>
           </div>
           <div class="app-feature-card">
             <div class="app-feature-head"><h3>📋 近期会话</h3><span class="af-cnt">${esc(recentSessions().length)}</span></div>
@@ -2488,4 +2775,8 @@ function render() {
   restoreChatScrollPosition();
 }
 
-init();
+if (isStockRoute()) {
+  void bootStockControlUi();
+} else {
+  init();
+}
